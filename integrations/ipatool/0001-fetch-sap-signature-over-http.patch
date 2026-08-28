@@ -1,0 +1,118 @@
+Subject: [PATCH] mescal: fetch the SAP action signature over HTTP
+
+Adds an optional remote signer so ipatool can obtain X-Apple-ActionSignature
+from a sap-unicorn signing service instead of CommerceKit, which removes the
+macOS requirement. Behaviour is unchanged unless IPATOOL_SAP_SIGNER_URL is
+set: Signer() falls back to the existing platform implementation.
+
+The GUID is derived with the same logic pkg/util/machine uses, so the SAP
+session on the server is bound to the very MAC address that is sent as `guid`
+inside the payload being signed.
+
+Apply with:  git apply 0001-fetch-sap-signature-over-http.patch
+
+diff --git a/pkg/appstore/appstore.go b/pkg/appstore/appstore.go
+index 6d0c80d..51b2058 100644
+--- a/pkg/appstore/appstore.go
++++ b/pkg/appstore/appstore.go
+@@ -57,7 +57,7 @@ type Args struct {
+ func NewAppStore(args Args) AppStore {
+ 	clientArgs := http.Args{
+ 		CookieJar:    args.CookieJar,
+-		ActionSigner: mescal.Sign,
++		ActionSigner: mescal.Signer(),
+ 	}
+ 
+ 	return &appstore{
+diff --git a/pkg/mescal/signer_remote.go b/pkg/mescal/signer_remote.go
+new file mode 100644
+index 0000000..cb50c76
+--- /dev/null
++++ b/pkg/mescal/signer_remote.go
+@@ -0,0 +1,86 @@
++package mescal
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"os"
++	"strings"
++	"time"
++)
++
++// EnvSignerURL points ipatool at an external SAP signing service (see
++// sap-unicorn's server.py) instead of the macOS-only CommerceKit path.
++const EnvSignerURL = "IPATOOL_SAP_SIGNER_URL"
++
++var remoteClient = &http.Client{Timeout: 120 * time.Second}
++
++// Signer returns the SAP action signer to use. When EnvSignerURL is set the
++// signature is fetched over HTTP, which works on any platform; otherwise the
++// built-in platform implementation is used.
++func Signer() func([]byte) ([]byte, error) {
++	base := strings.TrimRight(os.Getenv(EnvSignerURL), "/")
++	if base == "" {
++		return Sign
++	}
++
++	return func(data []byte) ([]byte, error) {
++		return remoteSign(base, data)
++	}
++}
++
++func remoteSign(base string, data []byte) ([]byte, error) {
++	guid, err := signerGUID()
++	if err != nil {
++		return nil, err
++	}
++
++	req, err := http.NewRequest(http.MethodPost,
++		fmt.Sprintf("%s/sign?guid=%s", base, guid), bytes.NewReader(data))
++	if err != nil {
++		return nil, fmt.Errorf("failed to create signing request: %w", err)
++	}
++	req.Header.Set("Content-Type", "application/octet-stream")
++
++	res, err := remoteClient.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("%w: signing service unreachable: %s", ErrUnavailable, err)
++	}
++	defer res.Body.Close()
++
++	body, err := io.ReadAll(res.Body)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read signing response: %w", err)
++	}
++
++	if res.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("signing service returned HTTP %d: %s",
++			res.StatusCode, strings.TrimSpace(string(body)))
++	}
++
++	if len(body) == 0 {
++		return nil, fmt.Errorf("signing service returned an empty signature")
++	}
++
++	return body, nil
++}
++
++// signerGUID derives the GUID the same way pkg/util/machine does, so the SAP
++// session is bound to the very MAC address that is sent as `guid` in the
++// payload being signed.
++func signerGUID() (string, error) {
++	interfaces, err := net.Interfaces()
++	if err != nil {
++		return "", fmt.Errorf("failed to get network interfaces: %w", err)
++	}
++
++	for _, netInterface := range interfaces {
++		if addr := netInterface.HardwareAddr.String(); addr != "" {
++			return strings.ReplaceAll(strings.ToUpper(addr), ":", ""), nil
++		}
++	}
++
++	return "", fmt.Errorf("could not find a network interface with a mac address")
++}

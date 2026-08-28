@@ -1,0 +1,15 @@
+# Apple's binary - extract it yourself with tools/extract.py, never commit it
+commerce
+commerce.*
+local_commerce
+*.i64
+
+# session / protocol artefacts
+*.bin
+setupCert.plist
+setup_post.plist
+bag*.xml
+
+venv/
+__pycache__/
+*.pyc
